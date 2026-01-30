@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>BioNamesDB ID Translator</title>
+  <style>
+    :root { color-scheme: light; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 0; padding: 18px; }
+    .wrap { max-width: 980px; margin: 0 auto; }
+    h1 { margin: 0 0 6px 0; font-size: 22px; }
+    .cap { color: #555; margin-bottom: 14px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .col { flex: 1; min-width: 240px; }
+    label { display:block; font-weight: 600; margin-bottom: 6px; }
+    select, textarea { width: 100%; box-sizing: border-box; padding: 9px 10px; border: 1px solid #ddd; border-radius: 8px; }
+    textarea { height: 170px; resize: vertical; }
+    .btnrow { display:flex; gap: 12px; align-items:center; flex-wrap: wrap; margin-top: 10px; }
+    button { padding: 10px 14px; border: 1px solid #ddd; background: #fff; border-radius: 10px; cursor: pointer; font-weight: 600; }
+    button.primary { background: #111; border-color: #111; color: #fff; }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .divider { height: 1px; background: #eee; margin: 14px 0; }
+    .status { white-space: pre-wrap; color: #333; font-size: 13px; }
+    .small { font-size: 12px; color: #666; }
+    .pill { display:inline-block; padding: 3px 8px; border-radius: 999px; background:#f0f0f0; font-size:12px; }
+    table { border-collapse: collapse; width: 100%; font-size: 12px; }
+    th, td { border: 1px solid #eee; padding: 6px 8px; text-align: left; vertical-align: top; }
+    thead th { background: #fafafa; position: sticky; top: 0; z-index: 1; }
+    .tablewrap { max-height: 420px; overflow: auto; border: 1px solid #eee; border-radius: 12px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>BioNamesDB ID Translator</h1>
+    <div class="cap">
+      Translate between identifier types using <span class="pill">BioNamesDB.txt</span> (loaded in the background).
+      <span class="small">Multi-values inside DB cells are split on <b>;</b>.</span>
+    </div>
+
+    <div class="row">
+      <div class="col">
+        <label for="inputDb">Input database</label>
+        <select id="inputDb"></select>
+      </div>
+      <div class="col">
+        <label for="outputDb">Output database</label>
+        <select id="outputDb"></select>
+      </div>
+    </div>
+
+    <div style="margin-top:12px;">
+      <label for="raw">Input IDs (whitespace or linebreak separated)</label>
+      <textarea id="raw" placeholder="A0A024QZX5;A0A087X1N8;P35237&#10;A0A024R161;P50151"></textarea>
+    </div>
+
+    <div class="btnrow">
+      <button id="autoBtn">Auto-detect input DB</button>
+      <button id="runBtn" class="primary">Translate</button>
+      <button id="dlBtn" style="display:none;">Download results (TSV)</button>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="status" id="status"></div>
+
+    <h3 style="margin:14px 0 8px 0;">Output</h3>
+    <div class="tablewrap" id="tableWrap" style="display:none;"></div>
+  </div>
+
+  <script>
+    const UNIPROT_ALL_ACCESSIONS = "UniProt All Accessions";
+    const VIRTUAL_COL_UNIPROT_ALL = "__uniprot_all_accessions__";
+
+    const DB_TO_COL = [
+      ["HGNC ID", "hgnc_id"],
+      ["HGNC Symbol", "symbol"],
+      ["HGNC Name", "name"],
+      ["HGNC Alias Symbol", "alias_symbol"],
+      ["Ensembl", "ensembl_gene_id"],
+      ["VEGA", "vega_id"],
+      ["ENA", "ena"],
+      ["RefSeq", "refseq_accession"],
+      ["CCDS", "ccds_id"],
+      ["PubMed", "pubmed_id"],
+      ["Enzyme Commission (EC)", "enzyme_id"],
+      ["RNAcentral", "rna_central_id"],
+      ["UniProt Accession", "uniprot_symbol"],
+      ["UniProt Name", "uniprot_name"],
+      ["UniProt Gene", "uniprot_gene"],
+      ["UniProt Description", "uniprot_description"],
+      ["UniProt Secondary Accession", "uniprot_alternative"],
+      [UNIPROT_ALL_ACCESSIONS, VIRTUAL_COL_UNIPROT_ALL],
+    ];
+
+    const BIO_NAME_DB_URL = "https://proteomics-data.com/wp-content/uploads/2026/01/BioNamesDB.txt";
+
+    const inputSel = document.getElementById("inputDb");
+    const outputSel = document.getElementById("outputDb");
+    const rawEl = document.getElementById("raw");
+    const statusEl = document.getElementById("status");
+    const autoBtn = document.getElementById("autoBtn");
+    const runBtn = document.getElementById("runBtn");
+    const dlBtn = document.getElementById("dlBtn");
+    const tableWrap = document.getElementById("tableWrap");
+
+    for (const [label] of DB_TO_COL) {
+      const o1 = document.createElement("option");
+      o1.value = label;
+      o1.textContent = label;
+      inputSel.appendChild(o1);
+
+      const o2 = document.createElement("option");
+      o2.value = label;
+      o2.textContent = label;
+      outputSel.appendChild(o2);
+    }
+
+    inputSel.value = "HGNC Symbol";
+    outputSel.value = "UniProt Accession";
+
+    const SPLIT_SEMI = /\s*;\s*/;
+
+    function splitCellValues(val) {
+      if (val == null) return [];
+      const s = String(val).trim();
+      if (!s) return [];
+      const parts = s.split(SPLIT_SEMI).map(x => x.trim()).filter(Boolean);
+      const seen = new Set();
+      const out = [];
+      for (const p of parts) {
+        if (!seen.has(p)) {
+          seen.add(p);
+          out.push(p);
+        }
+      }
+      return out;
+    }
+
+    function parseTextRows(raw) {
+      if (!raw) return [];
+      const s = String(raw).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trim();
+      if (!s) return [];
+      return s.split(/\s+/).map(t => t.trim()).filter(Boolean);
+    }
+
+    function tsvParse(tsvText) {
+      const lines = tsvText.split(/\r?\n/).filter(l => l.length);
+      if (lines.length === 0) return { header: [], rows: [] };
+      const header = lines[0].replace(/^\uFEFF/, "").split("\t").map(h => h.trim());
+      const rows = [];
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i];
+        if (!line.trim()) continue;
+        const cells = line.split("\t");
+        const obj = {};
+        for (let j = 0; j < header.length; j++) obj[header[j]] = cells[j] ?? "";
+        rows.push(obj);
+      }
+      return { header, rows };
+    }
+
+    function downloadText(filename, content, mime) {
+      const blob = new Blob([content], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    let DB = null;
+    let HEADER = [];
+    let ROWS = [];
+
+    const labelToSet = new Map();
+    const indexCache = new Map();
+    let lastTableRows = null;
+
+    function getCol(label) {
+      const found = DB_TO_COL.find(x => x[0] === label);
+      return found ? found[1] : null;
+    }
+
+    function valuesFromRow(row, colOrVirtual) {
+      if (colOrVirtual === VIRTUAL_COL_UNIPROT_ALL) {
+        const primary = splitCellValues(row["uniprot_symbol"]);
+        const secondary = splitCellValues(row["uniprot_alternative"]);
+        const seen = new Set();
+        const out = [];
+        for (const t of primary.concat(secondary)) {
+          if (t && !seen.has(t)) {
+            seen.add(t);
+            out.push(t);
+          }
+        }
+        return out;
+      }
+      return splitCellValues(row[colOrVirtual]);
+    }
+
+    function ensureLabelSet(label) {
+      if (labelToSet.has(label)) return labelToSet.get(label);
+
+      const col = getCol(label);
+      const s = new Set();
+
+      if (!col || !DB) {
+        labelToSet.set(label, s);
+        return s;
+      }
+
+      if (col === VIRTUAL_COL_UNIPROT_ALL) {
+        if (HEADER.includes("uniprot_symbol")) {
+          for (const r of ROWS) for (const v of splitCellValues(r["uniprot_symbol"])) s.add(v);
+        }
+        if (HEADER.includes("uniprot_alternative")) {
+          for (const r of ROWS) for (const v of splitCellValues(r["uniprot_alternative"])) s.add(v);
+        }
+        labelToSet.set(label, s);
+        return s;
+      }
+
+      if (!HEADER.includes(col)) {
+        labelToSet.set(label, s);
+        return s;
+      }
+
+      for (const r of ROWS) {
+        for (const v of splitCellValues(r[col])) s.add(v);
+      }
+      labelToSet.set(label, s);
+      return s;
+    }
+
+    function autodetectFromTokens(tokens) {
+      let bestScore = 0;
+      const scores = {};
+      for (const [label] of DB_TO_COL) {
+        const set = ensureLabelSet(label);
+        let sc = 0;
+        for (const x of tokens) if (set.has(x)) sc++;
+        scores[label] = sc;
+        if (sc > bestScore) bestScore = sc;
+      }
+
+      if (bestScore <= 0) return { bestLabel: null, scores };
+
+      const top = Object.entries(scores).filter(([_, sc]) => sc === bestScore).map(([lab]) => lab);
+      if (top.includes(UNIPROT_ALL_ACCESSIONS)) return { bestLabel: UNIPROT_ALL_ACCESSIONS, scores };
+
+      for (const [label] of DB_TO_COL) {
+        if (scores[label] === bestScore) return { bestLabel: label, scores };
+      }
+      return { bestLabel: null, scores };
+    }
+
+    function buildIndex(inLabel, outLabel) {
+      const inCol = getCol(inLabel);
+      const outCol = getCol(outLabel);
+      const key = `${inCol}→${outCol}`;
+      if (indexCache.has(key)) return indexCache.get(key);
+
+      const idx = new Map();
+      if (!inCol || !outCol || !DB) {
+        indexCache.set(key, idx);
+        return idx;
+      }
+
+      for (const r of ROWS) {
+        const ins = valuesFromRow(r, inCol);
+        const outs = valuesFromRow(r, outCol);
+        if (!ins.length || !outs.length) continue;
+
+        for (const i of ins) {
+          if (!idx.has(i)) idx.set(i, new Set());
+          const s = idx.get(i);
+          for (const o of outs) s.add(o);
+        }
+      }
+
+      indexCache.set(key, idx);
+      return idx;
+    }
+
+    function translateCell(cell, idx) {
+      const toks = splitCellValues(cell);
+      if (!toks.length) return { val: "NA", ok: false };
+
+      const outVals = new Set();
+      for (const t of toks) {
+        const set = idx.get(t);
+        if (!set) continue;
+        for (const o of set) outVals.add(o);
+      }
+
+      if (!outVals.size) return { val: "NA", ok: false };
+      return { val: Array.from(outVals).sort().join(";"), ok: true };
+    }
+
+    function renderTable(rows) {
+      if (!rows || !rows.length) {
+        tableWrap.style.display = "none";
+        tableWrap.innerHTML = "";
+        return;
+      }
+
+      const table = document.createElement("table");
+      const thead = document.createElement("thead");
+      const trh = document.createElement("tr");
+      ["input", "output", "matched"].forEach(h => {
+        const th = document.createElement("th");
+        th.textContent = h;
+        trh.appendChild(th);
+      });
+      thead.appendChild(trh);
+      table.appendChild(thead);
+
+      const tbody = document.createElement("tbody");
+      for (const r of rows) {
+        const tr = document.createElement("tr");
+        const td1 = document.createElement("td"); td1.textContent = r.input;
+        const td2 = document.createElement("td"); td2.textContent = r.output;
+        const td3 = document.createElement("td"); td3.textContent = r.matched ? "TRUE" : "FALSE";
+        tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3);
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+
+      tableWrap.innerHTML = "";
+      tableWrap.appendChild(table);
+      tableWrap.style.display = "block";
+    }
+
+    function rowsToTsv(rows) {
+      const header = ["input", "output", "matched"];
+      const lines = [header.join("\t")];
+      for (const r of rows) {
+        const a = r.input == null ? "" : String(r.input);
+        const b = r.output == null ? "" : String(r.output);
+        const c = r.matched ? "TRUE" : "FALSE";
+        lines.push([a, b, c].join("\t"));
+      }
+      return lines.join("\n") + "\n";
+    }
+
+    function setBusy(isBusy) {
+      autoBtn.disabled = isBusy;
+      runBtn.disabled = isBusy;
+      inputSel.disabled = isBusy;
+      outputSel.disabled = isBusy;
+      if (isBusy) dlBtn.style.display = "none";
+    }
+
+    async function loadDb() {
+      setBusy(true);
+      statusEl.textContent = "Loading BioNamesDB.txt ...";
+      tableWrap.style.display = "none";
+      tableWrap.innerHTML = "";
+
+      try {
+        const resp = await fetch(BIO_NAME_DB_URL, { cache: "no-cache" });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status} while fetching BioNamesDB.txt`);
+        const text = await resp.text();
+
+        DB = tsvParse(text);
+        HEADER = DB.header;
+        ROWS = DB.rows;
+
+        labelToSet.clear();
+        indexCache.clear();
+
+        statusEl.textContent = `Loaded ${ROWS.length} rows from BioNamesDB.txt.`;
+      } catch (e) {
+        statusEl.textContent = `Failed to load database.\n${String(e)}`;
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    let autodetectedInput = null;
+
+    function clearAutodetected() { autodetectedInput = null; }
+    rawEl.addEventListener("input", clearAutodetected);
+    inputSel.addEventListener("change", clearAutodetected);
+
+    autoBtn.addEventListener("click", () => {
+      if (!DB) return;
+      const cells = parseTextRows(rawEl.value);
+      const expanded = [];
+      for (const cell of cells) {
+        for (const t of splitCellValues(cell)) expanded.push(t);
+        if (expanded.length >= 20000) break;
+      }
+
+      if (!expanded.length) {
+        statusEl.textContent = "Please enter at least one ID to auto-detect.";
+        return;
+      }
+
+      setBusy(true);
+      try {
+        const { bestLabel, scores } = autodetectFromTokens(expanded);
+        if (!bestLabel) {
+          statusEl.textContent = "No matches found in any column; cannot auto-detect.";
+          autodetectedInput = null;
+          return;
+        }
+        autodetectedInput = bestLabel;
+        inputSel.value = bestLabel;
+        statusEl.textContent = `Auto-detected input DB: ${bestLabel} (${scores[bestLabel]}/${expanded.length} matches)`;
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    runBtn.addEventListener("click", () => {
+      if (!DB) return;
+      const cells = parseTextRows(rawEl.value);
+      if (!cells.length) {
+        statusEl.textContent = "Please enter at least one token (separated by whitespace/newlines).";
+        return;
+      }
+
+      const selectedInputLabel = inputSel.value;
+      const effectiveInputLabel = autodetectedInput || selectedInputLabel;
+      const outputLabel = outputSel.value;
+
+      setBusy(true);
+      try {
+        const idx = buildIndex(effectiveInputLabel, outputLabel);
+
+        let translatedCount = 0;
+        const tableRows = [];
+
+        for (const cell of cells) {
+          const { val, ok } = translateCell(cell, idx);
+          if (ok) translatedCount++;
+          tableRows.push({ input: cell, output: val, matched: ok });
+        }
+
+        lastTableRows = tableRows;
+        renderTable(tableRows);
+
+        statusEl.textContent =
+          `Translated using input DB: ${effectiveInputLabel} (selected: ${selectedInputLabel}) → ${outputLabel}.\n` +
+          `Translated: ${translatedCount}/${cells.length} rows.`;
+
+        const filename = `${effectiveInputLabel}_to_${outputLabel}.tsv`.replaceAll(" ", "_");
+        const content = rowsToTsv(tableRows);
+        dlBtn.style.display = "inline-block";
+        dlBtn.onclick = () => downloadText(filename, content, "text/tab-separated-values");
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    loadDb();
+  </script>
+</body>
+</html>
